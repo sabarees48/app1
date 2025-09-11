@@ -2,46 +2,82 @@ pipeline {
     agent any
 
     environment {
-        AWS_ACCOUNT_ID = '287043460198'
-        AWS_REGION     = 'ap-southeast-1'
-        ECR_REPO       = 'nodeapp1'   // unique per API
-        ECR_URI        = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+        AWS_REGION = "ap-southeast-1"       // 🔹 Change to your region
+        ECR_REPO = "287043460198.dkr.ecr.ap-southeast-1.amazonaws.com/nodeapp1" // 🔹 Your ECR repo
+        CLUSTER_NAME = "server-deployment"  // 🔹 Your EKS cluster name
     }
 
     stages {
-        stage('Set IMAGE_TAG') {
-            steps {
-                script {
-                    def ts = new Date().format("yyyyMMddHHmmss")
-                    env.IMAGE_TAG = ts
-                }
-            }
-        }
-
         stage('Checkout') {
             steps {
                 git branch: 'main', url: 'https://github.com/sabarees48/app1.git'
             }
         }
 
+        stage('Set IMAGE_TAG') {
+            steps {
+                script {
+                    IMAGE_TAG = sh(script: "date +%Y%m%d%H%M%S", returnStdout: true).trim()
+                }
+            }
+        }
+
         stage('Build & Push Image') {
             steps {
-                sh """
-                  docker build -t ${ECR_URI}:${IMAGE_TAG} .
-                  aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URI}
-                  docker push ${ECR_URI}:${IMAGE_TAG}
-                """
+                script {
+                    sh """
+                    docker build -t $ECR_REPO:$IMAGE_TAG .
+                    aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO
+                    docker push $ECR_REPO:$IMAGE_TAG
+                    """
+                }
             }
         }
 
         stage('Deploy to EKS') {
             steps {
-                sh """
-                  sed -i "s|<ECR_URI>|${ECR_URI}|g" deployment.yaml
-                  sed -i "s|:latest|:${IMAGE_TAG}|g" deployment.yaml
-                  kubectl apply -f deployment.yaml
-                  kubectl apply -f service.yaml
-                """
+                script {
+                    sh """
+                    sed -i 's|<ECR_URI>|$ECR_REPO|g' deployment.yaml
+                    sed -i 's|:latest|:$IMAGE_TAG|g' deployment.yaml
+                    kubectl apply -f deployment.yaml
+                    kubectl apply -f service.yaml
+                    """
+                }
+            }
+        }
+
+        stage('Install AWS Load Balancer Controller') {
+            steps {
+                script {
+                    def controllerExists = sh(
+                        script: "kubectl get deployment -n kube-system aws-load-balancer-controller --ignore-not-found",
+                        returnStatus: true
+                    )
+                    if (controllerExists != 0) {
+                        echo "Installing AWS Load Balancer Controller..."
+                        sh """
+                        helm repo add eks https://aws.github.io/eks-charts || true
+                        helm repo update
+
+                        helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
+                          -n kube-system \
+                          --set clusterName=$CLUSTER_NAME \
+                          --set serviceAccount.create=false \
+                          --set serviceAccount.name=aws-load-balancer-controller
+                        """
+                    } else {
+                        echo "AWS Load Balancer Controller already installed ✅"
+                    }
+                }
+            }
+        }
+
+        stage('Apply Ingress') {
+            steps {
+                script {
+                    sh "kubectl apply -f ingress.yaml"
+                }
             }
         }
     }
